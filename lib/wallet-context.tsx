@@ -10,22 +10,16 @@ import {
   type ReactNode,
 } from "react"
 
-type PhantomEvent = "connect" | "disconnect" | "accountChanged"
-
-type PhantomProvider = {
-  isPhantom?: boolean
-  publicKey?: { toString: () => string } | null
-  isConnected?: boolean
-  connect: (opts?: { onlyIfTrusted?: boolean }) => Promise<{ publicKey: { toString: () => string } }>
-  disconnect: () => Promise<void>
-  on?: (event: PhantomEvent, handler: (...args: any[]) => void) => void
-  removeListener?: (event: PhantomEvent, handler: (...args: any[]) => void) => void
+type Eip1193Provider = {
+  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>
+  on?: (event: string, handler: (...args: any[]) => void) => void
+  removeListener?: (event: string, handler: (...args: any[]) => void) => void
+  isMetaMask?: boolean
 }
 
 declare global {
   interface Window {
-    solana?: PhantomProvider
-    phantom?: { solana?: PhantomProvider }
+    ethereum?: Eip1193Provider
   }
 }
 
@@ -33,7 +27,7 @@ type WalletStatus = "idle" | "connecting" | "connected"
 
 type WalletContextValue = {
   address: string | null
-  network: string | null
+  chainId: string | null
   status: WalletStatus
   error: string | null
   hasWallet: boolean
@@ -43,111 +37,108 @@ type WalletContextValue = {
 
 const WalletContext = createContext<WalletContextValue | null>(null)
 
-function getProvider(): PhantomProvider | undefined {
-  if (typeof window === "undefined") return undefined
-  if (window.phantom?.solana?.isPhantom) return window.phantom.solana
-  if (window.solana?.isPhantom) return window.solana
-  return undefined
+const CHAIN_NAMES: Record<string, string> = {
+  "0x1": "Ethereum",
+  "0x89": "Polygon",
+  "0xa4b1": "Arbitrum",
+  "0xa": "Optimism",
+  "0x2105": "Base",
+  "0x38": "BNB Chain",
 }
 
-export function networkName(network: string | null): string {
-  return network ?? ""
+export function chainName(chainId: string | null): string {
+  if (!chainId) return ""
+  return CHAIN_NAMES[chainId] ?? `Chain ${Number.parseInt(chainId, 16)}`
 }
 
 export function shortenAddress(address: string): string {
-  return `${address.slice(0, 4)}…${address.slice(-4)}`
+  return `${address.slice(0, 6)}…${address.slice(-4)}`
 }
 
 export function WalletProvider({ children }: { children: ReactNode }) {
   const [address, setAddress] = useState<string | null>(null)
-  const [network, setNetwork] = useState<string | null>(null)
+  const [chainId, setChainId] = useState<string | null>(null)
   const [status, setStatus] = useState<WalletStatus>("idle")
   const [error, setError] = useState<string | null>(null)
   const [hasWallet, setHasWallet] = useState(false)
 
   useEffect(() => {
-    const provider = getProvider()
+    const provider = typeof window !== "undefined" ? window.ethereum : undefined
     setHasWallet(Boolean(provider))
     if (!provider) return
 
-    // Restore an already-trusted connection silently.
+    // Restore an already-authorized connection silently.
     provider
-      .connect({ onlyIfTrusted: true })
-      .then(({ publicKey }) => {
-        setAddress(publicKey.toString())
-        setNetwork("Solana")
-        setStatus("connected")
+      .request({ method: "eth_accounts" })
+      .then((accounts) => {
+        const list = accounts as string[]
+        if (list.length > 0) {
+          setAddress(list[0])
+          setStatus("connected")
+          provider
+            .request({ method: "eth_chainId" })
+            .then((id) => setChainId(id as string))
+            .catch(() => {})
+        }
       })
       .catch(() => {})
 
-    const handleConnect = (publicKey: { toString: () => string } | null) => {
-      if (publicKey) {
-        setAddress(publicKey.toString())
-        setNetwork("Solana")
-        setStatus("connected")
-      }
-    }
-    const handleDisconnect = () => {
-      setAddress(null)
-      setNetwork(null)
-      setStatus("idle")
-    }
-    const handleAccountChanged = (publicKey: { toString: () => string } | null) => {
-      if (publicKey) {
-        setAddress(publicKey.toString())
-        setStatus("connected")
-      } else {
+    const handleAccountsChanged = (accounts: string[]) => {
+      if (accounts.length === 0) {
         setAddress(null)
         setStatus("idle")
+      } else {
+        setAddress(accounts[0])
+        setStatus("connected")
       }
     }
+    const handleChainChanged = (id: string) => setChainId(id)
 
-    provider.on?.("connect", handleConnect)
-    provider.on?.("disconnect", handleDisconnect)
-    provider.on?.("accountChanged", handleAccountChanged)
+    provider.on?.("accountsChanged", handleAccountsChanged)
+    provider.on?.("chainChanged", handleChainChanged)
 
     return () => {
-      provider.removeListener?.("connect", handleConnect)
-      provider.removeListener?.("disconnect", handleDisconnect)
-      provider.removeListener?.("accountChanged", handleAccountChanged)
+      provider.removeListener?.("accountsChanged", handleAccountsChanged)
+      provider.removeListener?.("chainChanged", handleChainChanged)
     }
   }, [])
 
   const connect = useCallback(async () => {
-    const provider = getProvider()
+    const provider = typeof window !== "undefined" ? window.ethereum : undefined
     if (!provider) {
-      window.open("https://phantom.app/download", "_blank", "noopener,noreferrer")
+      window.open("https://metamask.io/download/", "_blank", "noopener,noreferrer")
       return
     }
     setError(null)
     setStatus("connecting")
     try {
-      const { publicKey } = await provider.connect()
-      setAddress(publicKey.toString())
-      setNetwork("Solana")
-      setStatus("connected")
+      const accounts = (await provider.request({
+        method: "eth_requestAccounts",
+      })) as string[]
+      const id = (await provider.request({ method: "eth_chainId" })) as string
+      setAddress(accounts[0] ?? null)
+      setChainId(id)
+      setStatus(accounts.length > 0 ? "connected" : "idle")
     } catch (err) {
       const message =
         err && typeof err === "object" && "code" in err && (err as { code: number }).code === 4001
           ? "Connection request rejected."
-          : "Could not connect to Phantom. Please try again."
+          : "Could not connect to your wallet. Please try again."
       setError(message)
       setStatus("idle")
     }
   }, [])
 
   const disconnect = useCallback(() => {
-    const provider = getProvider()
-    provider?.disconnect().catch(() => {})
     setAddress(null)
-    setNetwork(null)
+    setChainId(null)
     setStatus("idle")
     setError(null)
   }, [])
 
   const value = useMemo(
-    () => ({ address, network, status, error, hasWallet, connect, disconnect }),
-    [address, network, status, error, hasWallet, connect, disconnect],
+    () => ({ address, chainId, status, error, hasWallet, connect, disconnect }),
+    [address, chainId, status, error, hasWallet, connect, disconnect],
   )
 
   return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>
